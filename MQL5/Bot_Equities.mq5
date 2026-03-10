@@ -128,6 +128,7 @@ void OnTick()
    if(InpDataCollectionMode)
    {
       AppendDatasetRow(features);
+      ExecuteTrade(isLong); // Fa eseguire il trade al tester
       return;
    }
 

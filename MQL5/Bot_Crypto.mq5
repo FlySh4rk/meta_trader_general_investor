@@ -125,6 +125,7 @@ void OnTick()
    if(InpDataCollectionMode)
    {
       AppendDatasetRow(features);
+      ExecuteTrade(isLong, (double)features[0][4], (double)features[0][5]);
       return;
    }
 
