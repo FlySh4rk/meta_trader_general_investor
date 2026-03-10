@@ -16,6 +16,7 @@ input int    InpBBPeriod           = 20;
 input double InpBBDeviation        = 2.0;
 input int    InpRSIPeriod          = 14;
 input int    InpATRPeriod          = 14;
+input int    InpDonchianPeriod     = 20;
 input double InpTrendSlopeThreshold= 0.10;
 
 input bool   InpAllowShorts        = false;
@@ -26,6 +27,8 @@ input double InpRSIShortMin        = 72.0;
 
 input double InpSL_ATR_Mult        = 2.0;
 input double InpTP_ATR_Mult        = 3.2;
+input double InpTrailing_ATR_Mult  = 1.2;
+input double InpBE_Profit_ATR_Mult = 0.15;
 
 CTrade trade;
 int g_ema = INVALID_HANDLE;
@@ -34,6 +37,10 @@ int g_rsi = INVALID_HANDLE;
 int g_atr = INVALID_HANDLE;
 long g_onnx = INVALID_HANDLE;
 datetime g_lastBarTime = 0;
+
+void ManageTrailingStop();
+bool BuildBaseSignalAndFeatures(float &features[][10], bool &isLong);
+void AppendDatasetRow(const float &features[][10]);
 
 
 int OnInit()
@@ -49,6 +56,14 @@ int OnInit()
       return INIT_FAILED;
    }
 
+   int dcHighestShift = iHighest(_Symbol, _Period, MODE_HIGH, InpDonchianPeriod, 1);
+   int dcLowestShift  = iLowest(_Symbol, _Period, MODE_LOW, InpDonchianPeriod, 1);
+   if(dcHighestShift < 0 || dcLowestShift < 0)
+   {
+      Print("Storico insufficiente per Donchian(", InpDonchianPeriod, "). Errore: ", GetLastError());
+      return INIT_FAILED;
+   }
+
    if(!InpDataCollectionMode)
    {
       g_onnx = OnnxCreate(InpOnnxModelPath, ONNX_DEFAULT);
@@ -58,10 +73,10 @@ int OnInit()
          return INIT_FAILED;
       }
 
-      const long input_shape[] = {1, 9};
+      const long input_shape[] = {1, 10};
       if(!OnnxSetInputShape(g_onnx, 0, input_shape))
       {
-         Print("Errore OnnxSetInputShape [1,9]: ", GetLastError());
+         Print("Errore OnnxSetInputShape [1,10]: ", GetLastError());
          return INIT_FAILED;
       }
 
@@ -91,6 +106,8 @@ void OnDeinit(const int reason)
 
 void OnTick()
 {
+   ManageTrailingStop();
+
    datetime currBar = iTime(_Symbol, _Period, 0);
    if(currBar == g_lastBarTime)
       return;
@@ -102,7 +119,7 @@ void OnTick()
    if(HasOpenPositionByMagic())
       return;
 
-   float features[1][9];
+   float features[1][10];
    bool isLong = false;
    bool hasSignal = BuildBaseSignalAndFeatures(features, isLong);
    if(!hasSignal)
@@ -128,7 +145,7 @@ void OnTick()
 }
 
 
-bool BuildBaseSignalAndFeatures(float &features[][9], bool &isLong)
+bool BuildBaseSignalAndFeatures(float &features[][10], bool &isLong)
 {
    const int shift = 1;
    double emaBuff[2], rsiBuff[1], atrBuff[1], bbUp[1], bbMid[1], bbLow[1];
@@ -156,6 +173,19 @@ bool BuildBaseSignalAndFeatures(float &features[][9], bool &isLong)
    if(bbPos < 0.0) bbPos = 0.0;
    if(bbPos > 1.0) bbPos = 1.0;
 
+   int dcHighestShift = iHighest(_Symbol, _Period, MODE_HIGH, InpDonchianPeriod, shift);
+   int dcLowestShift  = iLowest(_Symbol, _Period, MODE_LOW, InpDonchianPeriod, shift);
+   if(dcHighestShift < 0 || dcLowestShift < 0) return false;
+
+   double dcUpper = iHigh(_Symbol, _Period, dcHighestShift);
+   double dcLower = iLow(_Symbol, _Period, dcLowestShift);
+   double dcRange = dcUpper - dcLower;
+   if(dcRange <= 0.0) return false;
+
+   double donchianPos = (close1 - dcLower) / dcRange;
+   if(donchianPos < 0.0) donchianPos = 0.0;
+   if(donchianPos > 1.0) donchianPos = 1.0;
+
    // Buy-the-dip bias in structural bullish markets.
    bool longSignal = regimeUp && bbPos <= InpBBPosLongMax && rsiBuff[0] <= InpRSILongMax;
 
@@ -180,9 +210,89 @@ bool BuildBaseSignalAndFeatures(float &features[][9], bool &isLong)
    features[0][4] = (float)(atr / close1);                // ATR_Norm
    features[0][5] = (float)((close1 - emaBuff[0]) / atr); // DistEMA
    features[0][6] = (float)bbPos;                         // BB_Pos
-   features[0][7] = isTrend ? 1.0f : 0.0f;                // isTrend
-   features[0][8] = isLong ? 1.0f : 0.0f;                 // isLong
+   features[0][7] = (float)donchianPos;                   // Donchian_Pos
+   features[0][8] = isTrend ? 1.0f : 0.0f;                // isTrend
+   features[0][9] = isLong ? 1.0f : 0.0f;                 // isLong
    return true;
+}
+
+
+void ManageTrailingStop()
+{
+   double atrBuff[1];
+   if(CopyBuffer(g_atr, 0, 0, 1, atrBuff) <= 0)
+      return;
+   double atr = atrBuff[0];
+   if(atr <= _Point)
+      return;
+
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   if(bid <= 0.0 || ask <= 0.0)
+      return;
+
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(!PositionSelectByTicket(ticket)) continue;
+
+      string sym = PositionGetString(POSITION_SYMBOL);
+      long mg = PositionGetInteger(POSITION_MAGIC);
+      if(sym != _Symbol || mg != InpMagicNumber)
+         continue;
+
+      long type = PositionGetInteger(POSITION_TYPE);
+      double currentSL = PositionGetDouble(POSITION_SL);
+      double currentTP = PositionGetDouble(POSITION_TP);
+      double entry = PositionGetDouble(POSITION_PRICE_OPEN);
+      double newSL = currentSL;
+
+      if(type == POSITION_TYPE_BUY)
+      {
+         double trailingCandidate = NormalizeDouble(bid - InpTrailing_ATR_Mult * atr, _Digits);
+         if(currentSL <= 0.0 || trailingCandidate > newSL)
+            newSL = trailingCandidate;
+
+         // Stepped trailing: a meta TP-distance move at 50% progress.
+         if(currentTP > entry)
+         {
+            double tpDistance = currentTP - entry;
+            double halfTarget = entry + 0.5 * tpDistance;
+            if(bid >= halfTarget)
+            {
+               double beBuffer = NormalizeDouble(entry + InpBE_Profit_ATR_Mult * atr, _Digits);
+               if(beBuffer > newSL)
+                  newSL = beBuffer;
+            }
+         }
+      }
+      else if(type == POSITION_TYPE_SELL)
+      {
+         double trailingCandidate = NormalizeDouble(ask + InpTrailing_ATR_Mult * atr, _Digits);
+         if(currentSL <= 0.0 || trailingCandidate < newSL)
+            newSL = trailingCandidate;
+
+         if(currentTP < entry)
+         {
+            double tpDistance = entry - currentTP;
+            double halfTarget = entry - 0.5 * tpDistance;
+            if(ask <= halfTarget)
+            {
+               double beBuffer = NormalizeDouble(entry - InpBE_Profit_ATR_Mult * atr, _Digits);
+               if(newSL <= 0.0 || beBuffer < newSL)
+                  newSL = beBuffer;
+            }
+         }
+      }
+      else
+      {
+         continue;
+      }
+
+      if(newSL != currentSL)
+         trade.PositionModify(ticket, newSL, currentTP);
+   }
 }
 
 
@@ -241,13 +351,13 @@ void EnsureDatasetHeader()
 
    if(FileSize(handle) == 0)
    {
-      FileWrite(handle, "SlopeNorm", "RSI", "Hour", "Day", "ATR_Norm", "DistEMA", "BB_Pos", "isTrend", "isLong");
+      FileWrite(handle, "SlopeNorm", "RSI", "Hour", "Day", "ATR_Norm", "DistEMA", "BB_Pos", "Donchian_Pos", "isTrend", "isLong");
    }
    FileClose(handle);
 }
 
 
-void AppendDatasetRow(const float &features[][9])
+void AppendDatasetRow(const float &features[][10])
 {
    int handle = FileOpen(InpDatasetFileName, FILE_READ | FILE_WRITE | FILE_CSV | FILE_ANSI | FILE_COMMON);
    if(handle == INVALID_HANDLE)
@@ -266,8 +376,9 @@ void AppendDatasetRow(const float &features[][9])
       DoubleToString(features[0][4], 8),
       DoubleToString(features[0][5], 6),
       DoubleToString(features[0][6], 6),
-      DoubleToString(features[0][7], 0),
-      DoubleToString(features[0][8], 0)
+      DoubleToString(features[0][7], 6),
+      DoubleToString(features[0][8], 0),
+      DoubleToString(features[0][9], 0)
    );
    FileClose(handle);
 }

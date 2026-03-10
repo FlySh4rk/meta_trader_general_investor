@@ -27,6 +27,7 @@ FEATURE_COLUMNS = [
     "ATR_Norm",
     "DistEMA",
     "BB_Pos",
+    "Donchian_Pos",
     "isTrend",
     "isLong",
 ]
@@ -146,17 +147,21 @@ def main() -> None:
     )
     model.fit(x, y, sample_weight=sample_weight)
 
-    # Critical for MT5 stability: fixed input shape [1, 9]
-    initial_type = [("float_input", FloatTensorType([1, 9]))]
+    # Critical for MT5 stability: fixed input shape [1, 10]
+    initial_type = [("float_input", FloatTensorType([1, 10]))]
     onnx_model = convert_sklearn(
         model,
         initial_types=initial_type,
         options={id(model): {"zipmap": False}},
     )
 
-    # "Nuclear option": remove probability tensor so MT5 reads a strict label output.
-    if len(onnx_model.graph.output) > 1:
-        onnx_model.graph.output.pop()
+    # "Nuclear option": always remove the last output tensor (probabilities)
+    # so MT5 reads a strict [1,1] label output and avoids crash 5808.
+    if len(onnx_model.graph.output) < 2:
+        raise RuntimeError(
+            "ONNX graph output inatteso: servono almeno 2 output prima del pop()."
+        )
+    onnx_model.graph.output.pop()
 
     with output_path.open("wb") as f:
         f.write(onnx_model.SerializeToString())
