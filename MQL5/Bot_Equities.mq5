@@ -9,7 +9,8 @@ input string InpDatasetFileName    = "Dataset.csv";
 input string InpOnnxModelPath      = "C:\\Users\\metat\\Desktop\\CursorTrader\\NOT_FOREX_TRADER\\hybrid_gatekeeper_rf.onnx";
 input long   InpMagicNumber        = 30001;
 input int    InpMaxSpreadPoints    = 300;
-input double InpLots               = 0.10;
+input double InpRiskPercent        = 1.0; // Risk per trade (%)
+input bool   InpVerboseLogs        = true;
 
 input int    InpEMAPeriod          = 100;
 input int    InpBBPeriod           = 20;
@@ -41,6 +42,7 @@ datetime g_lastBarTime = 0;
 void ManageTrailingStop();
 bool BuildBaseSignalAndFeatures(float &features[][10], bool &isLong);
 void AppendDatasetRow(const float &features[][10]);
+void LogInfo(const string msg);
 
 
 int OnInit()
@@ -110,24 +112,41 @@ void OnTick()
 
    datetime currBar = iTime(_Symbol, _Period, 0);
    if(currBar == g_lastBarTime)
+   {
+      LogInfo("No trade: non e' una nuova barra.");
       return;
+   }
    g_lastBarTime = currBar;
 
    if(SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) > InpMaxSpreadPoints)
+   {
+      LogInfo(
+         "No trade: spread troppo alto. spread="
+         + IntegerToString((int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD))
+         + " max=" + IntegerToString(InpMaxSpreadPoints)
+      );
       return;
+   }
 
    if(HasOpenPositionByMagic())
+   {
+      LogInfo("No trade: posizione gia' aperta per symbol+magic.");
       return;
+   }
 
    float features[1][10];
    bool isLong = false;
    bool hasSignal = BuildBaseSignalAndFeatures(features, isLong);
    if(!hasSignal)
+   {
+      LogInfo("No trade: nessun segnale base valido.");
       return;
+   }
 
    if(InpDataCollectionMode)
    {
       AppendDatasetRow(features);
+      LogInfo("DataCollectionMode=true: riga dataset salvata, esecuzione trade per tester.");
       ExecuteTrade(isLong); // Fa eseguire il trade al tester
       return;
    }
@@ -136,13 +155,20 @@ void OnTick()
    output_label[0][0] = 0;
    if(!OnnxRun(g_onnx, ONNX_NO_CONVERSION, features, output_label))
    {
-      Print("OnnxRun fallita: ", GetLastError());
+      LogInfo("No trade: OnnxRun fallita. err=" + IntegerToString(GetLastError()));
       return;
    }
 
    int pred = (int)output_label[0][0];
    if(pred == 1)
+   {
+      LogInfo("ONNX pred=1: trigger ExecuteTrade.");
       ExecuteTrade(isLong);
+   }
+   else
+   {
+      LogInfo("No trade: ONNX pred=0.");
+   }
 }
 
 
@@ -301,28 +327,115 @@ void ExecuteTrade(bool isLong)
 {
    double atrBuff[1];
    if(CopyBuffer(g_atr, 0, 1, 1, atrBuff) <= 0)
+   {
+      LogInfo("No trade: CopyBuffer ATR fallita.");
       return;
+   }
    double atr = atrBuff[0];
    if(atr <= _Point)
+   {
+      LogInfo("No trade: ATR non valido. atr=" + DoubleToString(atr, 8));
       return;
+   }
 
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    if(ask <= 0.0 || bid <= 0.0)
+   {
+      LogInfo(
+         "No trade: prezzi ask/bid non validi. ask="
+         + DoubleToString(ask, _Digits) + " bid=" + DoubleToString(bid, _Digits)
+      );
       return;
+   }
+
+   double riskAmount = AccountInfoDouble(ACCOUNT_EQUITY) * (InpRiskPercent / 100.0);
+   double slDistance = InpSL_ATR_Mult * atr;
+   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   if(tickSize <= 0.0 || tickValue <= 0.0 || slDistance <= 0.0)
+   {
+      LogInfo(
+         "No trade: parametri risk invalidi. tickSize=" + DoubleToString(tickSize, 10)
+         + " tickValue=" + DoubleToString(tickValue, 10)
+         + " slDistance=" + DoubleToString(slDistance, 8)
+      );
+      return;
+   }
+
+   double riskPerLot = (slDistance / tickSize) * tickValue;
+   if(riskPerLot <= 0.0)
+   {
+      LogInfo("No trade: riskPerLot non valido. riskPerLot=" + DoubleToString(riskPerLot, 8));
+      return;
+   }
+
+   double rawLots = riskAmount / riskPerLot;
+   double volumeStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double volumeMin = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double volumeMax = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   if(volumeStep <= 0.0 || volumeMin <= 0.0 || volumeMax <= 0.0)
+   {
+      LogInfo(
+         "No trade: specifiche volume invalide. step=" + DoubleToString(volumeStep, 8)
+         + " min=" + DoubleToString(volumeMin, 8)
+         + " max=" + DoubleToString(volumeMax, 8)
+      );
+      return;
+   }
+
+   double lots = MathRound(rawLots / volumeStep) * volumeStep;
+   if(lots < volumeMin) lots = volumeMin;
+   if(lots > volumeMax) lots = volumeMax;
+   lots = NormalizeDouble(lots, 8);
+
+   LogInfo(
+      "RiskSizing: equity=" + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2)
+      + " risk%=" + DoubleToString(InpRiskPercent, 2)
+      + " riskAmount=" + DoubleToString(riskAmount, 2)
+      + " rawLots=" + DoubleToString(rawLots, 8)
+      + " lots=" + DoubleToString(lots, 8)
+   );
 
    double sl = 0.0, tp = 0.0;
+   bool sent = false;
    if(isLong)
    {
       sl = NormalizeDouble(ask - InpSL_ATR_Mult * atr, _Digits);
       tp = NormalizeDouble(ask + InpTP_ATR_Mult * atr, _Digits);
-      trade.Buy(InpLots, _Symbol, 0.0, sl, tp, "EquityHybrid");
+      sent = trade.Buy(lots, _Symbol, 0.0, sl, tp, "EquityHybrid");
    }
    else
    {
       sl = NormalizeDouble(bid + InpSL_ATR_Mult * atr, _Digits);
       tp = NormalizeDouble(bid - InpTP_ATR_Mult * atr, _Digits);
-      trade.Sell(InpLots, _Symbol, 0.0, sl, tp, "EquityHybrid");
+      sent = trade.Sell(lots, _Symbol, 0.0, sl, tp, "EquityHybrid");
+   }
+
+   string dir = isLong ? "BUY" : "SELL";
+   if(sent)
+   {
+      LogInfo(
+         "Trade OPENED: " + dir
+         + " symbol=" + _Symbol
+         + " lots=" + DoubleToString(lots, 8)
+         + " sl=" + DoubleToString(sl, _Digits)
+         + " tp=" + DoubleToString(tp, _Digits)
+         + " retcode=" + IntegerToString((int)trade.ResultRetcode())
+         + " deal=" + IntegerToString((int)trade.ResultDeal())
+         + " order=" + IntegerToString((int)trade.ResultOrder())
+      );
+   }
+   else
+   {
+      LogInfo(
+         "Trade NOT opened: " + dir
+         + " symbol=" + _Symbol
+         + " lots=" + DoubleToString(lots, 8)
+         + " retcode=" + IntegerToString((int)trade.ResultRetcode())
+         + " desc=" + trade.ResultRetcodeDescription()
+         + " comment=" + trade.ResultComment()
+      );
    }
 }
 
@@ -382,4 +495,11 @@ void AppendDatasetRow(const float &features[][10])
       DoubleToString(features[0][9], 0)
    );
    FileClose(handle);
+}
+
+
+void LogInfo(const string msg)
+{
+   if(InpVerboseLogs)
+      Print("[EquityHybrid] ", msg);
 }
