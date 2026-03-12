@@ -57,6 +57,7 @@ def _find_column(df: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]:
 def _extract_profit_series(report_df: pd.DataFrame) -> pd.Series:
     candidate_names = [
         "Profit",
+        "Profitto",
         "profit",
         "P/L",
         "PL",
@@ -120,9 +121,9 @@ def _build_sample_weights(train_df: pd.DataFrame) -> np.ndarray:
 
 def main() -> None:
     project_root = Path(__file__).resolve().parents[1]
-    dataset_path = project_root / "Dataset.csv"
-    report_path = project_root / "ReportTester.csv"
-    output_path = project_root / "hybrid_gatekeeper_rf.onnx"
+    dataset_path = project_root / "Dataset_BTCUSD_20260312.csv"
+    report_path = project_root / "ReportTester-101668240_backtestBTCUSD.csv"
+    output_path = project_root / "hybrid_gatekeeper_rf_BTCUSD.onnx"
 
     if not dataset_path.exists():
         raise FileNotFoundError(f"File non trovato: {dataset_path}")
