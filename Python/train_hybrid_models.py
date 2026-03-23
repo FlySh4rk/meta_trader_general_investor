@@ -1,178 +1,134 @@
-#!/usr/bin/env python3
-"""
-Train a hybrid MT5 gatekeeper model (RandomForest -> ONNX label-only output).
-
-Expected files in project root (NOT_FOREX_TRADER):
-  - Dataset.csv      : feature rows exported by EA
-  - ReportTester.csv : MT5 report/deals used to derive labels
-"""
-
-from __future__ import annotations
-
-from pathlib import Path
-from typing import Iterable, Optional
-
-import numpy as np
 import pandas as pd
+import numpy as np
+import warnings
+import io
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report, accuracy_score
 from skl2onnx import convert_sklearn
 from skl2onnx.common.data_types import FloatTensorType
 
+warnings.filterwarnings('ignore')
 
-FEATURE_COLUMNS = [
-    "SlopeNorm",
-    "RSI",
-    "Hour",
-    "Day",
-    "ATR_Norm",
-    "DistEMA",
-    "BB_Pos",
-    "Donchian_Pos",
-    "isTrend",
-    "isLong",
-]
+# ==========================================
+# 🛑 MODIFICA SOLO QUESTI NOMI OGNI VOLTA 🛑
+# ==========================================
+CSV_FILE = "Dataset.csv"
+REPORT_FILE = "ReportTester.csv"
+ONNX_FILENAME = "hybrid_gatekeeper_rf.onnx"
+# ==========================================
 
+print("--- AVVIO ADDESTRAMENTO IA DEFINITIVO (CRYPTO/EQUITIES) ---")
 
-def _read_csv_auto(path: Path) -> pd.DataFrame:
-    """Read CSV trying common separators used by MT5 exports."""
-    separators = [",", ";", "\t"]
-    for sep in separators:
-        try:
-            df = pd.read_csv(path, sep=sep)
-            if df.shape[1] > 1:
-                return df
-        except Exception:
-            continue
-    return pd.read_csv(path)
+# 1. LETTURA DATASET EA (ORA CON COLONNA TIME!)
+try:
+    # engine='python' e sep=None permettono di riconoscere sia virgole che punti e virgola
+    df_csv = pd.read_csv(CSV_FILE, sep=None, engine='python')
+    if 'Time' not in df_csv.columns:
+        print("❌ ERRORE CRITICO: La colonna 'Time' manca nel Dataset.csv!")
+        print("Assicurati di aver aggiornato le funzioni MQL5 come indicato.")
+        exit(1)
+    df_csv['Time'] = pd.to_datetime(df_csv['Time'])
+except Exception as e:
+    print(f"Errore lettura Dataset: {e}")
+    exit(1)
 
+# 2. LETTURA REPORT MT5 (PARSER INTELLIGENTE ANTI-SPAZZATURA)
+with open(REPORT_FILE, 'r', encoding='utf-8', errors='replace') as f:
+    lines = f.readlines()
 
-def _find_column(df: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]:
-    cols_lower = {c.lower(): c for c in df.columns}
-    for name in candidates:
-        if name.lower() in cols_lower:
-            return cols_lower[name.lower()]
-    return None
+header_idx = -1
+delimiter = ','
+for i, line in enumerate(lines):
+    # Cerca la riga di intestazione della tabella
+    if 'Time' in line or 'Ora' in line:
+        header_idx = i
+        if ';' in line: delimiter = ';'
+        elif '\t' in line: delimiter = '\t'
+        break
 
+if header_idx == -1:
+    print("❌ ERRORE: Impossibile trovare l'intestazione dei trade nel Report MT5.")
+    exit(1)
 
-def _extract_profit_series(report_df: pd.DataFrame) -> pd.Series:
-    candidate_names = [
-        "Profit",
-        "Profitto",
-        "profit",
-        "P/L",
-        "PL",
-        "Result",
-        "NetProfit",
-        "Net Profit",
-    ]
-    col = _find_column(report_df, candidate_names)
-    if not col:
-        raise ValueError(
-            "Impossibile trovare la colonna profitto in ReportTester.csv. "
-            f"Colonne disponibili: {list(report_df.columns)}"
-        )
+# Carica il CSV usando la libreria standard solo dalla riga corretta in poi
+csv_data = "".join(lines[header_idx:])
+df_report = pd.read_csv(io.StringIO(csv_data), sep=delimiter)
 
-    numeric_profit = pd.to_numeric(report_df[col], errors="coerce").dropna()
-    # Ignore pure zero rows (fees-only/headers/no-trade noise).
-    numeric_profit = numeric_profit[numeric_profit != 0.0]
-    if numeric_profit.empty:
-        raise ValueError("Nessun trade valido trovato nel report MT5.")
-    return numeric_profit.reset_index(drop=True)
+# Auto-riconoscimento della colonna Orario e Profitto (Italiano/Inglese)
+time_col = next((c for c in df_report.columns if c.lower() in ['time', 'ora']), None)
+profit_col = next((c for c in df_report.columns if c.lower() in ['profitto', 'profit', 'result', 'p/l']), None)
 
+if not time_col or not profit_col:
+    print("❌ ERRORE: Impossibile identificare le colonne Orario o Profitto nel Report MT5.")
+    exit(1)
 
-def _build_training_frame(dataset_df: pd.DataFrame, deal_profits: pd.Series) -> pd.DataFrame:
-    missing = [c for c in FEATURE_COLUMNS if c not in dataset_df.columns]
-    if missing:
-        raise ValueError(
-            "Dataset.csv non contiene tutte le feature richieste. Mancano: "
-            + ", ".join(missing)
-        )
+# Pulizia dei dati del report
+df_report[time_col] = pd.to_datetime(df_report[time_col], errors='coerce')
+df_report[profit_col] = pd.to_numeric(df_report[profit_col], errors='coerce')
+df_report = df_report.dropna(subset=[time_col, profit_col])
+df_report = df_report[df_report[profit_col] != 0.0] # Scarta depositi e trade nulli
 
-    ds = dataset_df[FEATURE_COLUMNS].copy()
-    n = min(len(ds), len(deal_profits))
-    if n == 0:
-        raise ValueError("Dataset o report vuoto dopo il preprocessing.")
+# 3. MERGE ESATTO: LO SCUDO CONTRO I GHOST TRADES
+df_merged = pd.merge(df_csv, df_report, left_on='Time', right_on=time_col, how='inner')
 
-    if len(ds) != len(deal_profits):
-        print(
-            f"[WARN] Righe non allineate (Dataset={len(ds)}, Deals={len(deal_profits)}). "
-            f"Uso prime {n} righe per allineamento sequenziale."
-        )
+if len(df_merged) == 0:
+    print("❌ ERRORE CRITICO: Nessun trade combacia tra il Dataset e il Report!")
+    print("Questo significa che tutti i trade sono Ghost Trades o le date non coincidono.")
+    exit(1)
 
-    ds = ds.iloc[:n].copy()
-    ds["target"] = (deal_profits.iloc[:n] > 0.0).astype(np.int64).values
-    return ds
+# Il Target: 1 se in profitto, 0 se in perdita
+df_merged['Target'] = (df_merged[profit_col] > 0).astype(np.int64)
 
+# 4. PREPARAZIONE DATI E FEATURES (Le 10 di Cursor)
+FEATURES = ['SlopeNorm', 'RSI', 'Hour', 'Day', 'ATR_Norm', 'DistEMA', 'BB_Pos', 'Donchian_Pos', 'isTrend', 'isLong']
 
-def _build_sample_weights(train_df: pd.DataFrame) -> np.ndarray:
-    """
-    Equity-friendly bias:
-    boost long pullbacks in trend when BB_Pos is near lower band.
-    """
-    w = np.ones(len(train_df), dtype=np.float32)
-    mask_long_pullback = (
-        (train_df["isTrend"] > 0.5)
-        & (train_df["isLong"] > 0.5)
-        & (train_df["BB_Pos"] <= 0.20)
-    )
-    w[mask_long_pullback.values] = 2.5
-    return w
+for feat in FEATURES:
+    if feat not in df_merged.columns:
+        print(f"❌ ERRORE: Feature mancante nel dataset: {feat}")
+        exit(1)
 
+X = df_merged[FEATURES].values.astype(np.float32)
+y = df_merged['Target'].values.astype(np.int64)
 
-def main() -> None:
-    project_root = Path(__file__).resolve().parents[1]
-    dataset_path = project_root / "Dataset_BTCUSD_20260312.csv"
-    report_path = project_root / "ReportTester-101668240_backtestBTCUSD.csv"
-    output_path = project_root / "hybrid_gatekeeper_rf_BTCUSD.onnx"
+# 5. BIAS "BUY THE DIP" PER ASSET FORTI (Azioni/Crypto)
+weights = np.ones(len(df_merged), dtype=np.float32)
+# Premiamo con un peso x2.5 le entrate Long vicino alla base delle Bollinger in Uptrend
+mask_dip = (df_merged['isTrend'] > 0.5) & (df_merged['isLong'] > 0.5) & (df_merged['BB_Pos'] <= 0.20)
+weights[mask_dip] = 2.5
 
-    if not dataset_path.exists():
-        raise FileNotFoundError(f"File non trovato: {dataset_path}")
-    if not report_path.exists():
-        raise FileNotFoundError(f"File non trovato: {report_path}")
+# 6. ADDESTRAMENTO RANDOM FOREST
+rf = RandomForestClassifier(n_estimators=150, max_depth=5, min_samples_split=10, class_weight='balanced_subsample', random_state=42, n_jobs=-1)
+rf.fit(X, y, sample_weight=weights)
 
-    dataset_df = _read_csv_auto(dataset_path)
-    report_df = _read_csv_auto(report_path)
-    profits = _extract_profit_series(report_df)
-    train_df = _build_training_frame(dataset_df, profits)
+# 7. VALUTAZIONE E REPORTISTICA A SCHERMO
+y_pred = rf.predict(X)
 
-    x = train_df[FEATURE_COLUMNS].astype(np.float32).values
-    y = train_df["target"].astype(np.int64).values
-    sample_weight = _build_sample_weights(train_df)
+print("\n==================================================")
+print("             REPORT DI AFFIDABILITÀ               ")
+print("==================================================")
+print(f"Trade registrati dal Bot : {len(df_csv)}")
+print(f"Trade eseguiti in MT5    : {len(df_report)}")
+print(f"Trade Sincronizzati      : {len(df_merged)} (Scartati: {len(df_csv) - len(df_merged)} ghost trades)")
+print("--------------------------------------------------")
+print(f"Win Rate senza IA        : {(y.sum() / len(y)) * 100:.2f}%")
+print(f"Accuratezza Globale IA   : {accuracy_score(y, y_pred) * 100:.2f}%\n")
 
-    model = RandomForestClassifier(
-        n_estimators=150,
-        max_depth=5,
-        random_state=42,
-        class_weight="balanced_subsample",
-        n_jobs=-1,
-    )
-    model.fit(x, y, sample_weight=sample_weight)
+print("Dettaglio Metriche (0 = Trade da Bloccare, 1 = Trade da Eseguire):")
+print(classification_report(y, y_pred))
+print("==================================================\n")
 
-    # Critical for MT5 stability: fixed input shape [1, 10]
-    initial_type = [("float_input", FloatTensorType([1, 10]))]
-    onnx_model = convert_sklearn(
-        model,
-        initial_types=initial_type,
-        options={id(model): {"zipmap": False}},
-    )
+# 8. ESPORTAZIONE ONNX: L'OPZIONE NUCLEARE [1, 10]
+initial_type = [('float_input', FloatTensorType([1, 10]))]
+onnx_model = convert_sklearn(rf, initial_types=initial_type, options={id(rf): {'zipmap': False}})
 
-    # "Nuclear option": always remove the last output tensor (probabilities)
-    # so MT5 reads a strict [1,1] label output and avoids crash 5808.
-    if len(onnx_model.graph.output) < 2:
-        raise RuntimeError(
-            "ONNX graph output inatteso: servono almeno 2 output prima del pop()."
-        )
-    onnx_model.graph.output.pop()
+# Rimozione forzata delle probabilità per evitare l'errore 5808 su MT5
+if len(onnx_model.graph.output) < 2:
+    print("⚠️ ERRORE ONNX: Struttura inattesa, servono almeno 2 output per il pop().")
+    exit(1)
 
-    with output_path.open("wb") as f:
-        f.write(onnx_model.SerializeToString())
+onnx_model.graph.output.pop()
 
-    positive_rate = float(np.mean(y))
-    print("Training completato.")
-    print(f"- Righe usate: {len(train_df)}")
-    print(f"- Hit-rate positivo: {positive_rate:.2%}")
-    print(f"- ONNX salvato in: {output_path}")
+with open(ONNX_FILENAME, "wb") as f:
+    f.write(onnx_model.SerializeToString())
 
-
-if __name__ == "__main__":
-    main()
+print(f"✅ Modello ONNX esportato con successo in: {ONNX_FILENAME}")

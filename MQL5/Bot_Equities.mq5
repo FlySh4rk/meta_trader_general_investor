@@ -143,13 +143,58 @@ void OnTick()
       return;
    }
 
+   // --- INIZIO FIX DATA COLLECTION CON OTTIMIZZAZIONE E SINCRONIA ---
    if(InpDataCollectionMode)
    {
-      AppendDatasetRow(features);
-      LogInfo("DataCollectionMode=true: riga dataset salvata, esecuzione trade per tester.");
-      ExecuteTrade(isLong); // Fa eseguire il trade al tester
+      // 1. Contiamo le posizioni prima di agire
+      int positions_before = PositionsTotal();
+      
+      // 2. Eseguiamo il trade (senza scrivere ancora nulla)
+      ExecuteTrade(isLong, (double)features[0][4], (double)features[0][5]); 
+      // ATTENZIONE: per il file Bot_Equities.mq5 usa solo -> ExecuteTrade(isLong);
+      
+      // 3. Scriviamo nel CSV SOLO se:
+      //    A) NON siamo in ottimizzazione
+      //    B) Il trade è stato effettivamente aperto dal broker
+      if(!MQLInfoInteger(MQL_OPTIMIZATION))
+      {
+         if(PositionsTotal() > positions_before)
+         {
+            AppendDatasetRow(features);
+            LogInfo("DataCollectionMode=true: Trade APERTO, riga dataset salvata.");
+         }
+         else
+         {
+            LogInfo("DataCollectionMode=true: Trade FALLITO. Riga dataset saltata.");
+         }
+      }
       return;
    }
+// --- FINE FIX ---
+
+   // --- INIZIO FIX DATA COLLECTION (Sincronia 1:1) ---
+   if(InpDataCollectionMode)
+   {
+      // 1. Contiamo quante posizioni abbiamo ORA
+      int positions_before = PositionsTotal();
+      
+      // 2. Tentiamo l'esecuzione del trade
+      ExecuteTrade(isLong, (double)features[0][4], (double)features[0][5]); 
+      // ATTENZIONE: per il file Bot_Equities.mq5 usa solo -> ExecuteTrade(isLong);
+      
+      // 3. Scriviamo nel CSV SOLO se il numero di posizioni è aumentato (il broker ha accettato l'ordine!)
+      if(PositionsTotal() > positions_before)
+      {
+         AppendDatasetRow(features);
+         LogInfo("DataCollectionMode=true: Trade APERTO con successo, riga dataset salvata.");
+      }
+      else
+      {
+         LogInfo("DataCollectionMode=true: Trade FALLITO. Riga dataset saltata per mantenere l'allineamento.");
+      }
+      return;
+   }
+// --- FINE FIX ---
 
    long output_label[1][1];
    output_label[0][0] = 0;
@@ -465,7 +510,8 @@ void EnsureDatasetHeader()
 
    if(FileSize(handle) == 0)
    {
-      FileWrite(handle, "SlopeNorm", "RSI", "Hour", "Day", "ATR_Norm", "DistEMA", "BB_Pos", "Donchian_Pos", "isTrend", "isLong");
+      // AGGIUNTA LA COLONNA "Time" ALL'INIZIO!
+      FileWrite(handle, "Time", "SlopeNorm", "RSI", "Hour", "Day", "ATR_Norm", "DistEMA", "BB_Pos", "Donchian_Pos", "isTrend", "isLong");
    }
    FileClose(handle);
 }
@@ -481,8 +527,13 @@ void AppendDatasetRow(const float &features[][10])
    }
 
    FileSeek(handle, 0, SEEK_END);
+   
+   // ESTRAIAMO L'ORARIO ESATTO DEL TRADE
+   string timeStr = TimeToString(TimeCurrent(), TIME_DATE | TIME_MINUTES);
+   
    FileWrite(
       handle,
+      timeStr, // <--- ORA SALVIAMO IL TEMPO!
       DoubleToString(features[0][0], 6),
       DoubleToString(features[0][1], 6),
       DoubleToString(features[0][2], 0),
